@@ -1,0 +1,218 @@
+import os
+import random
+import json
+import schedule
+import time
+from datetime import datetime, timedelta
+import requests
+from pytz import timezone
+import threading
+import sqlite3
+from pathlib import Path
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
+
+# Configuration
+CONFIG = {
+    "TELEGRAM_BOT_TOKEN": "7887687989:AAGcNEE8Cb_tW81DxlxzBroqDvA3HpDNELM",
+    "TELEGRAM_CHAT_ID": "7130589902",
+    "PRAYER_TIMES_API": "http://api.aladhan.com/v1/timingsByAddress",
+    "QURAN_API": "https://api.alquran.cloud/v1/",
+    "LOCATION": {
+        "address": "Hodge Hill, Birmingham, UK",
+        "method": 2,  # ISNA
+        "school": 1,   # Shafi for Asr time
+        "timezone": "Europe/London"
+    },
+    "SCHEDULE": {
+        "daily_verses_time": "08:00",
+        "stories_time": "18:00",
+        "random_verses_per_day": 3
+    }
+}
+
+# Database setup
+DB_FILE = "quran_bot.db"
+
+def init_database():
+    """Initialize SQLite database"""
+    conn = None
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS verses (
+            id INTEGER PRIMARY KEY,
+            surah_number INTEGER,
+            surah_name TEXT,
+            ayah_number INTEGER,
+            arabic_text TEXT,
+            translation TEXT,
+            last_sent DATE DEFAULT NULL
+        )""")
+
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS stories (
+            id INTEGER PRIMARY KEY,
+            title TEXT,
+            content TEXT,
+            source TEXT,
+            last_sent DATE DEFAULT NULL
+        )""")
+
+        conn.commit()
+    except sqlite3.Error as e:
+        print(f"Database error: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+def safe_api_request(url, params=None, max_retries=3):
+    """Make API requests with error handling"""
+    for attempt in range(max_retries):
+        try:
+            response = requests.get(url, params=params, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            if not data.get('data'):
+                raise ValueError("Missing API data")
+            return data
+        except Exception as e:
+            print(f"Attempt {attempt+1} failed: {e}")
+            time.sleep(2)
+    return None
+
+def populate_quran_data():
+    """Populate Quran verses from API"""
+    conn = None
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT COUNT(*) FROM verses")
+        if cursor.fetchone()[0] == 0:
+            print("Loading Quran verses...")
+
+            surahs = safe_api_request(f"{CONFIG['QURAN_API']}surah")['data']
+            for surah in surahs:
+                verses = safe_api_request(
+                    f"{CONFIG['QURAN_API']}surah/{surah['number']}/en.sahih"
+                )['data']['ayahs']
+
+                for verse in verses:
+                    cursor.execute(
+                        """INSERT INTO verses VALUES
+                        (NULL, ?, ?, ?, ?, ?, NULL)""",
+                        (
+                            surah['number'],
+                            surah['englishName'],
+                            verse['numberInSurah'],
+                            verse['text'],
+                            verse.get('translation', 'Translation not available')
+                        )
+                    )
+                print(f"Loaded Surah {surah['number']}")
+                time.sleep(1)
+
+            conn.commit()
+            print("✅ Quran loading complete")
+
+    except Exception as e:
+        print(f"Error loading Quran: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+def get_prayer_times():
+    """Get REAL prayer times for Hodge Hill"""
+    params = {
+        "address": CONFIG["LOCATION"]["address"],
+        "method": CONFIG["LOCATION"]["method"],
+        "school": CONFIG["LOCATION"]["school"],
+        "timezonestring": CONFIG["LOCATION"]["timezone"]
+    }
+
+    data = safe_api_request(CONFIG["PRAYER_TIMES_API"], params)
+    if not data:
+        print("⚠️ Using fallback prayer times")
+        return {
+            "Fajr": "05:30", "Dhuhr": "13:00", "Asr": "16:00",
+            "Maghrib": "19:00", "Isha": "20:30"
+        }
+
+    return data['data']['timings']
+
+def send_telegram_message(text):
+    """Send message via Telegram"""
+    try:
+        url = f"https://api.telegram.org/bot{CONFIG['TELEGRAM_BOT_TOKEN']}/sendMessage"
+        requests.post(url, json={
+            "chat_id": CONFIG["TELEGRAM_CHAT_ID"],
+            "text": text,
+            "parse_mode": "Markdown"
+        })
+    except Exception as e:
+        print(f"Telegram send error: {e}")
+
+def send_prayer_reminder(prayer_name):
+    """Send prayer alert with Quran verse"""
+    conn = sqlite3.connect(DB_FILE)
+    verse = conn.execute("""
+        SELECT * FROM verses 
+        ORDER BY RANDOM() 
+        LIMIT 1
+    """).fetchone()
+    conn.close()
+
+    message = (
+        f"🕌 *{prayer_name} Reminder*\n\n"
+        f"*{verse[2]} ({verse[1]}:{verse[3]})*\n"
+        f"{verse[4]}\n"
+        f"_{verse[5]}_\n\n"
+        "May Allah accept your prayer ❤️"
+    )
+    send_telegram_message(message)
+
+def schedule_prayer_reminders():
+    """Schedule daily prayer reminders"""
+    times = get_prayer_times()
+    schedule.clear('prayers')
+
+    for prayer in ["Fajr", "Dhuhr", "Asr", "Maghrib", "Isha"]:
+        schedule.every().day.at(times[prayer]).do(
+            send_prayer_reminder, prayer
+        ).tag('prayers')
+        print(f"Scheduled {prayer} at {times[prayer]}")
+
+# [Other functions like send_daily_verses(), etc.]
+
+def main():
+    """Start the bot"""
+    init_database()
+    populate_quran_data()
+
+    # Schedule all tasks
+    schedule.every().day.at("00:01").do(schedule_prayer_reminders)
+    schedule_prayer_reminders()  # Initial schedule
+
+    # Start bot
+    app = Application.builder().token(CONFIG["TELEGRAM_BOT_TOKEN"]).build()
+    app.add_handler(CommandHandler("start", start))
+
+    # Run scheduler in background
+    threading.Thread(target=lambda: [schedule.run_pending(), time.sleep(1)], daemon=True).start()
+
+    print("🤖 Bot is running!")
+    app.run_polling()
+
+if __name__ == "__main__":
+    from telegram import Update
+    from telegram.ext import ContextTypes
+
+    async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await update.message.reply_text(
+            "🌙 Assalamu Alaikum! The Quran bot is active and will send you reminders and verses daily, InshaAllah.")
+
+
+    main()      add all the extra code to this and PLEASE DONT MAKE ANY MISTAKES i was at this since 12 
